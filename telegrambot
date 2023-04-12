@@ -4,9 +4,11 @@ import pandas as pd
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
 from datetime import datetime
+from io import BytesIO
+
 
 # create a bot instance
-bot = telegram.Bot(token='your_token_here')
+bot = telegram.Bot(token='6288060688:AAFwfQEFvfFwntDPPO_lqnUeZkEs_G9oipk')
 
 # define global variables
 transactions_received = []
@@ -89,27 +91,32 @@ def show_total(update, context):
 
 def build_books(update, context):
     """Download individual Excel sheets for all transaction documentation."""
+    global books_df
     chat_id = update.effective_chat.id
     for recipient_type in set([transaction['recipient_type'] for transaction in transactions_received]):
         df = pd.DataFrame([transaction for transaction in transactions_received if transaction['recipient_type'] == recipient_type])
         df.to_excel(f'{recipient_type}_transactions.xlsx', index=False)
-    context.bot.send_document(chat_id=chat_id, document=open('Personal_transactions.xlsx', 'rb'))
-    context.bot.send_document(chat_id=chat_id, document=open('Business_transactions.xlsx', 'rb'))
+    for recipient_type in set([transaction['recipient_type'] for transaction in transactions_received]):
+        context.bot.send_document(chat_id=chat_id, document=open(f'{recipient_type}_transactions.xlsx', 'rb'))
 
 def check_transaction(update, context):
     """Check if a transaction has been received."""
     chat_id = update.effective_chat.id
     message_id = update.effective_message.message_id
     match = re.search(transaction_pattern, update.effective_message.text)
+    
     if match:
         sender, amount, recipient_bank, recipient_account, recipient_name, _, _, recipient_type, date = match.groups()
         transaction = {'sender': sender, 'amount': amount, 'recipient_bank': recipient_bank, 'recipient_account': recipient_account, 'recipient_name': recipient_name, 'recipient_type': recipient_type, 'date': date, 'message_id': message_id}
-        if any([transaction['message_id'] == t['message_id'] for t in transactions_received]):
+        
+        if any(transaction['message_id'] == t['message_id'] for t in transactions_received):
             context.bot.send_message(chat_id=chat_id, text='This transaction has already been marked as received.')
+        
         else:
             buttons = [[InlineKeyboardButton('Received ✅', callback_data=f'received:{message_id}'), InlineKeyboardButton('Not Received ❌', callback_data=f'not_received:{message_id}')]]
             reply_markup = InlineKeyboardMarkup(buttons)
             context.bot.send_message(chat_id=chat_id, text='Has the transaction been received?', reply_markup=reply_markup)
+    
     else:
         context.bot.send_message(chat_id=chat_id, text='Sorry, I could not recognize this message as a transaction. Please make sure your message matches the following format:\n\n"Sender Name\n£Amount\nRecipient Bank\nRecipient Account\n\nRecipient Name\nSort Code\nAccount Number\nRecipient Type\n\nPaid ✅ DD/MM/YYYY"')
 
@@ -128,6 +135,8 @@ else:
 
 def handle_callback(update, context):
     """Handle button callbacks."""
+    global transactions_received
+    global total_amount_received
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     data = update.callback_query.data
@@ -147,6 +156,9 @@ def handle_callback(update, context):
     elif data.startswith('send_screenshot:'):
         context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text='Please upload a screenshot of the transaction.')
         context.bot.delete_message(chat_id=chat_id, message_id=update.callback_query.message.reply_to_message.message_id)
+    else:
+        context.bot.send_message(chat_id=chat_id, text='Sorry, I could not understand your request.')
+
 
 def handle_document(update, context):
     """Handle uploaded documents."""
@@ -165,13 +177,11 @@ def build_menu(buttons, n_cols, header_buttons=None, footer_buttons=None):
 
 def error_callback(update, context):
     """Log errors and send a message to notify the user."""
+    logger.error('Update "%s" caused error "%s"', update, context.error)
     try:
         raise context.error
     except Exception as e:
-        context.bot.send_message(chat_id
-
-
-
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"Oops, something went wrong: {str(e)}")
 
 
 def main():
@@ -191,5 +201,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
