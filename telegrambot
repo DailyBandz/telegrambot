@@ -12,15 +12,14 @@ from io import BytesIO
 from telegram import Update
 from telegram.ext import CallbackContext
 from telegram.ext import Dispatcher
+from telegram.ext.callbackqueryhandler import CallbackQueryHandler
+from telegram.ext.commandhandler import CommandHandler
+
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
-
-
-
 transaction_pattern = r"^(.*?)\n£([\d,.]+)(?:\sTotal deal £([\d,.]+))?\n(.*)\n(?:(.*?)(?:\n|$))?(?:Recipient Type: (.*?)\n)?(?:(.*?)(?:\n|$))?(.*?)(?:\n|$).*Done ✅ (\d{1,2}\/\d{1,2})"
-
 
 # create a bot instance
 bot = telegram.Bot(token='6288060688:AAFwfQEFvfFwntDPPO_lqnUeZkEs_G9oipk')
@@ -32,7 +31,6 @@ books_df = pd.DataFrame(columns=['Sender', 'Amount', 'Recipient Bank', 'Recipien
 
 # define menu options
 menu_options = [['Scan Chat 🔎'], ['Show Total 💰'], ['Books 📚']]
-
 
 def start(update, context):
     chat_id = update.effective_chat.id
@@ -60,20 +58,51 @@ def send_menu_options(update, context):
     context.bot.send_message(chat_id=chat_id, text=message, reply_markup=reply_markup)
 
 
-def extract_transaction_details(update: Update, context: CallbackContext) -> None:
-    global total_amount_received
-    message = update.message.text
-    match = re.search(transaction_pattern, message)
-    if match:
-        sender, amount, sender_bank, recipient_name, recipient_bank, recipient_account, date = match.groups()
-        transaction = {'sender': sender, 'amount': amount, 'sender_bank': sender_bank, 'recipient_name': recipient_name, 'recipient_bank': recipient_bank, 'recipient_account': recipient_account, 'date': date}
-        transactions_received.append(transaction)
-        total_amount_received += float(amount.strip('£').replace(',', ''))
-
+def extract_transaction_details(message):
+    """
+    Extracts transaction details from a message that contains the keywords "Paid" or "Done".
+    Returns a tuple containing the transaction amount and the transaction date.
+    """
+    amount_pattern = r"£([\d,]+(?:\.\d{2})?)"
+    date_pattern = r"\d{2}/\d{2}/\d{4}"
+    amount_matches = re.findall(amount_pattern, message)
+    date_matches = re.findall(date_pattern, message)
+    if len(amount_matches) == 1 and len(date_matches) == 1:
+        amount = float(amount_matches[0].replace(",", ""))
+        date = date_matches[0]
+        return amount, date
+    else:
+        return None
 
 def scan_chat(update: Update, context: CallbackContext):
-    # Add a job to the job queue
-    context.job_queue.run_once(scan_chat_async, 0, context=(update, context))
+    """Scan the chat for messages containing transaction information and add them to the database."""
+    # Retrieve the chat id
+    chat_id = update.message.chat_id
+
+    # Retrieve the chat messages
+    messages = context.bot.get_chat_history(chat_id=chat_id, limit=100)
+
+    # Loop through the messages and extract transaction information
+    for message in messages:
+        # Check if the message contains transaction information
+        if 'Sender' in message.text and 'Amount' in message.text and 'Bank' in message.text and 'Receiver' in message.text and 'Reference' in message.text:
+            # Parse the message to extract transaction details
+            details = message.text.split('\n')
+            sender = details[0].replace('Sender: ', '')
+            amount = float(details[1].replace('Amount: £', '').replace(',', ''))
+            bank = details[2].replace('Bank: ', '')
+            receiver = details[3].replace('Receiver: ', '')
+            reference = details[4].replace('Reference: ', '')
+
+            # Insert the transaction into the database
+            conn = sqlite3.connect('transactions.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO transactions (sender, amount, bank, receiver, reference) VALUES (?, ?, ?, ?, ?)", (sender, amount, bank, receiver, reference))
+            conn.commit()
+            conn.close()
+
+    # Send a message to the user indicating that the scan is complete
+    update.message.reply_text('Scan complete.')
 
 
 def scan_chat_async(update: Update, context: CallbackContext):
@@ -171,16 +200,56 @@ def check_transaction(update, context):
         if any(transaction['message_id'] == t['message_id'] for t in transactions_received):
             context.bot.send_message(chat_id=chat_id, text='This transaction has already been marked as received.')
         else:
-            transactions_received.append(transaction)
-            buttons = [[InlineKeyboardButton('Received ✅', callback_data=f'received:{message_id}')], [InlineKeyboardButton('Not Received ❌', callback_data=f'not_received:{message_id}')]]
+            # Define unique callback data based on the message ID
+            callback_data = f'received:{message_id}'
+
+            # Define the inline keyboard markup with the unique callback data
+            buttons = [[InlineKeyboardButton('Received ✅', callback_data=callback_data)], [InlineKeyboardButton('Not Received ❌', callback_data=callback_data)]]
             reply_markup = InlineKeyboardMarkup(buttons)
-            context.bot.send_message(chat_id=chat_id, text='Has the transaction been received?', reply_markup=reply_markup)
+
+            transactions_received.append(transaction)
+
+            # Send the message with the inline keyboard markup
+            update.message.reply_text('Has the transaction been received?', reply_markup=reply_markup)
     else:
         context.bot.send_message(chat_id=chat_id, text="This message doesn't match the transaction pattern.")
         print(f"Received message: {update.effective_message.text}")
 
+def handle_button_press(update, context):
+    """Handle button press."""
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+    data = query.data
+
+    # Update the transaction status
+    if data.startswith('received'):
+        message = 'Transaction marked as received.'
+        index = next((i for i, x in enumerate(transactions_received) if x['message_id'] == int(data.split(':')[1])), None)
+        transactions_received[index]['status'] = 'received'
+    else:
+        message = 'Transaction marked as not received.'
+        index = next((i for i, x in enumerate(transactions_received) if x['message_id'] == int(data.split(':')[1])), None)
+        transactions_received[index]['status'] = 'not_received'
+
+    # Send a message to the user indicating that the transaction status has been updated
+    context.bot.send_message(chat_id=chat_id, text=message)
+
+    # Edit the message with the updated button text
+    buttons = [[InlineKeyboardButton('Received ✅', callback_data=f'received:{message_id}')], [InlineKeyboardButton('Not Received ❌', callback_data=f'not_received:{message_id}')]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+
+
     
-   
+def handle_message(message):
+    if "Paid" in message or "Done" in message:
+        transaction = extract_transaction(message)
+        if transaction:
+            send_message("Transaction found: " + transaction)
+            send_buttons()
+    else:
+        send_message("No transaction found.")
    
 def handle_callback(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
@@ -249,6 +318,16 @@ def error_callback(update, context):
         context.bot.send_message(chat_id=update.effective_chat.id, text=f"Oops, something went wrong: {str(e)}")
 
 
+def processing_update(update: Update, context: CallbackContext) -> None:
+    """Process received updates"""
+    message = update.message.text.lower()
+    if "paid" in message:
+        reply_keyboard = [['Received', 'Not Received']]
+        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+        update.message.reply_text('Did you receive the payment?', reply_markup=markup)
+    else:
+        update.message.reply_text('Thanks for the update!')
+
 
 
 def main():
@@ -265,12 +344,12 @@ def main():
     # Add handler to send menu options when bot is added to group chat
     dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members, send_menu_options))
 
-    dispatcher.add_handler(CommandHandler('scan_chat', scan_chat))
-    dispatcher.add_handler(CommandHandler('show_total', show_total))
-    dispatcher.add_handler(CommandHandler('books', build_books))
-    dispatcher.add_handler(CallbackQueryHandler(handle_callback))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_transaction))
-    dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
+    dispatcher.add_handler(CommandHandler('start', start, pass_args=True))
+    dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members, send_menu_options))
+    dispatcher.add_handler(CommandHandler('scan_chat', scan_chat, pass_args=True))
+    dispatcher.add_handler(CommandHandler('show_total', show_total, pass_args=True))
+    dispatcher.add_handler(CommandHandler('books', build_books, pass_args=True))
+    dispatcher.add_handler(CallbackQueryHandler(handle_callback, pass_chat_data=True))
     dispatcher.add_error_handler(error)
     
     # Start the job queue
